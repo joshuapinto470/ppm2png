@@ -6,98 +6,120 @@ http://paulbourke.net/dataformats/ppm/
 */
 
 #include <iostream>
-#include <lodepng.h>
 #include <fstream>
+#include <sstream>
 #include <vector>
+#include <string>
+#include <lodepng.h>
 
-int main(int argc, char *argv[]){
-
-    if (argc < 3){
-        std :: cout << "Too few arguments.\n";
-        std :: cout << "USEAGE : ppm2png <input file> <output file>\n";
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        std::cout << "Too few arguments.\n";
+        std::cout << "USAGE: ppm2png <input file> <output file>\n";
         return -1;
     }
 
-    const char* fname = argv[1];
-    const char* foutname = argv[2];//"image.png";
+    std::string fname = argv[1];
+    std::string foutname = argv[2];
 
     std::ifstream f(fname, std::ios::in | std::ios::binary | std::ios::ate);
-
-    // read the contents of the PPM file into memory
-    char* imagebuffer = nullptr;
-    std::streampos size;
-
-    int WIDTH, HEIGHT;
-
-    if(f.is_open()){
-        size = f.tellg();
-        imagebuffer = new char[size];
-        f.seekg(0, std::ios::beg);
-        f.read(imagebuffer, size);
-        f.close();
-    }else{
-        std :: cout << "Error reading file!\n";
+    if (!f.is_open()) {
+        std::cerr << "Error: Could not open input file: " << fname << "\n";
         return -1;
     }
 
-    uint8_t WID_BYT_LEN, HEI_BYT_LEN, DAT_BYT_STRT;
+    std::streamsize size = f.tellg();
+    f.seekg(0, std::ios::beg);
 
-    for(WID_BYT_LEN = 0;; WID_BYT_LEN++)
-        if (imagebuffer[3 + WID_BYT_LEN] == ' ') break;
+    std::vector<char> imagebuffer(size);
+    if (!f.read(imagebuffer.data(), size)) {
+        std::cerr << "Error: Failed to read file contents.\n";
+        return -1;
+    }
+    f.close();
 
-    for(HEI_BYT_LEN = 0;; HEI_BYT_LEN++)
-        if (imagebuffer[3 + WID_BYT_LEN + 1 + HEI_BYT_LEN] == '\n') break;
+    // Parse PPM Header safely using a string stream
+    // Format expected: P3 (or P6), width, height, max_val
+    std::string header_buffer(imagebuffer.begin(), imagebuffer.end());
+    std::stringstream header_stream(header_buffer);
 
-    char* str_rep_wid = new char[WID_BYT_LEN];
-    char* str_rep_hei = new char[HEI_BYT_LEN];
+    std::string magic_number;
+    int width = 0, height = 0, max_val = 0;
 
-    errno_t e1 =  memcpy_s(str_rep_wid, WID_BYT_LEN, imagebuffer + 3, WID_BYT_LEN);
-    errno_t e2 = memcpy_s(str_rep_hei, HEI_BYT_LEN, imagebuffer + 3 + WID_BYT_LEN + 1, HEI_BYT_LEN);
-
-    WIDTH = atoi(str_rep_wid);
-    HEIGHT = atoi(str_rep_hei);
-
-    DAT_BYT_STRT = WID_BYT_LEN + HEI_BYT_LEN + 9;
-
-    std ::vector<uint8_t> encodedPNG;
-    std ::vector<uint8_t> tocodePNG;
-    tocodePNG.reserve(WIDTH * HEIGHT * 4);
-
-    for (int i = DAT_BYT_STRT; i < size; i = i + 3) {
-        tocodePNG.push_back((int)(uint8_t)imagebuffer[i]);      // R
-        tocodePNG.push_back((int)(uint8_t)imagebuffer[i + 1]);  // G
-        tocodePNG.push_back((int)(uint8_t)imagebuffer[i + 2]);  // B
-        tocodePNG.push_back(255);                               // A
+    header_stream >> magic_number;
+    if (magic_number != "P3") {
+        std::cerr << "Error: Only plain PPM (P3) format is supported by this parser.\n";
+        return -1;
     }
 
-    
-    unsigned error = lodepng::encode(encodedPNG, tocodePNG, WIDTH, HEIGHT);
-    if (error)
+    header_stream >> width >> height >> max_val;
+    if (width <= 0 || height <= 0 || max_val <= 0) {
+        std::cerr << "Error: Invalid PPM header dimensions.\n";
         return -1;
-    else
-        lodepng::save_file(encodedPNG, foutname);
+    }
 
-    delete fname;
-    delete foutname;
-    delete str_rep_hei;
-    delete str_rep_wid;
-    delete[] imagebuffer;
-    
+    // Find where the pixel data actually starts in the buffer after the header
+    // We skip past magic number, width, height, and max_val whitespace tokens.
+    std::string token;
+    int tokens_to_skip = 3; // P3, width, height, max_val (4 items total, parsed 1 magic + 3 values)
+    size_t data_start_pos = 0;
+    int parsed_count = 0;
+
+    // Scan through the raw buffer to find the end of the 4th header token
+    for (size_t i = 0; i < imagebuffer.size(); ++i) {
+        if (imagebuffer[i] == ' ' || imagebuffer[i] == '\t' || imagebuffer[i] == '\n' || imagebuffer[i] == '\r') {
+            parsed_count++;
+            if (parsed_count == 4) {
+                // Skip any trailing consecutive whitespace right after max_val
+                while (i < imagebuffer.size() && (imagebuffer[i] == ' ' || imagebuffer[i] == '\t' || imagebuffer[i] == '\n' || imagebuffer[i] == '\r')) {
+                    i++;
+                }
+                data_start_pos = i;
+                break;
+            }
+        }
+    }
+
+    if (data_start_pos == 0 || data_start_pos >= (size_t)size) {
+        std::cerr << "Error: Malformed PPM data offset.\n";
+        return -1;
+    }
+
+    // Parse pixel data
+    std::vector<uint8_t> tocodePNG;
+    tocodePNG.reserve(width * height * 4);
+
+    // Using a stringstream over the remaining raw data to safely parse ASCII values for P3
+    std::stringstream data_stream(std::string(imagebuffer.begin() + data_start_pos, imagebuffer.end()));
+    int r, g, b;
+    int pixel_count = 0;
+
+    while (data_stream >> r >> g >> b) {
+        tocodePNG.push_back(static_cast<uint8_t>(r));
+        tocodePNG.push_back(static_cast<uint8_t>(g));
+        tocodePNG.push_back(static_cast<uint8_t>(b));
+        tocodePNG.push_back(255); // Alpha channel
+        pixel_count++;
+    }
+
+    if (pixel_count != width * height) {
+        std::cout << "Warning: Expected " << (width * height) << " pixels, but parsed " << pixel_count << " pixels.\n";
+    }
+
+    // Encode to PNG using LodePNG
+    std::vector<uint8_t> encodedPNG;
+    unsigned error = lodepng::encode(encodedPNG, tocodePNG, width, height);
+    if (error) {
+        std::cerr << "Error: LodePNG encoding failed: " << lodepng_error_text(error) << "\n";
+        return -1;
+    }
+
+    error = lodepng::save_file(encodedPNG, foutname);
+    if (error) {
+        std::cerr << "Error: Failed to save output PNG file.\n";
+        return -1;
+    }
+
+    std::cout << "Successfully converted " << fname << " to " << foutname << " (" << width << "x" << height << ")\n";
     return 0;
 }
-
-/*
-HEADER -> P3\n1920 1080\n255\n<DATA>
-^  
-|
-3 bytes - > "P3\n" takes 3 bytes which we can ignore (for now)
-
-We need to figure out how many bytes the WIDTH (in this case 1920 takes 4 bytes) ascii char takes.
-We also need to figure out how many bytes the HEIGHT (in this case 1080 takes 4 bytes) ascii char takes.
-
-The WIDTH byte length (WID_BYT_LEN) will start from 3 and end at ascii " " <- space char
-The HEIGHT byte length (HEI_BYT_LEN) will start from 3 + WID_BYT_LEN + 1 and end at \n char
-
-The data will start from DAT_BYT_STRT = 3 + WID_BYT_LEN + 1 + HEI_BYT_LEN + 1 + '3' + 1 (in this case 17) bytes
-so we need to forward the image data array by DAT_BYT_STRT - 1 bytes.
-*/
